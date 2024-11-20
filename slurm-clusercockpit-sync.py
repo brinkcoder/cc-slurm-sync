@@ -14,6 +14,16 @@ import json
 import requests
 import re
 
+
+def extract_nodelist(nodelist):
+    if isinstance(nodelist, dict) and 'list' in nodelist:
+        return nodelist['list']
+    elif isinstance(nodelist, str):
+        return nodelist
+    else:
+        raise ValueError(f"Unsupported nodelist format: {nodelist}")
+
+
 class CCApi:
     config = {}
     apiurl = ''
@@ -119,7 +129,7 @@ class SlurmSync:
     def _jobRunning(self, jobid):
         for job in self.slurmJobData['jobs']:
             if int(job['job_id']) == int(jobid):
-                if job['job_state'] in ['RUNNING', 'COMPLETING']:
+                if job['job_state'][0] in ['RUNNING', 'COMPLETING']:
                     return True
         return False
 
@@ -167,6 +177,8 @@ class SlurmSync:
 
     def _ccStartJob(self, job):
         print("INFO: Crate job %s, user %s, partition %s, name %s" % (job['job_id'], job['user_name'], job['partition'], job['name']))
+#        print(f"Debug: job['job_resources'] = {job['job_resources']}")
+
         nodelist = self._convertNodelist(job['job_resources']['nodes'])
 
         # Exclusive job?
@@ -219,7 +231,7 @@ class SlurmSync:
             'cluster' : self.config['clustername'],
             'numNodes' : job['node_count']['number'],
             'numHwthreads' : job['cpus']['number'],
-            'startTime': job['start_time'],
+            'startTime': job['start_time']['number'],
             'walltime': int(job['time_limit']['number']) * 60,
             'project': job['account'],
             'partition': job['partition'],
@@ -234,7 +246,7 @@ class SlurmSync:
 
         # is this part of an array job?
         if job['array_job_id']['set'] and job['array_job_id']['number'] > 0:
-            data.update({"arrayJobId" : job['array_job_id']})
+            data.update({"arrayJobId" : job['array_job_id']['number']})
 
         i = 0
         num_acc = 0
@@ -242,21 +254,26 @@ class SlurmSync:
             # begin dict
             resources = {'hostname' : node.strip()}
 
-            # if a job uses a node exclusive, there are some assigned cpus (used by this job)
-            # and some unassigned cpus. In this case, the assigned_cpus are those which have
-            # to be monitored, otherwise use the unassigned cpus. 
-            sockets = job['job_resources']['allocated_nodes'][i]['sockets']
-            hwthreads = []
-            for socket,cores in sockets.items():
-                for cid, state in cores['cores'].items():
-                    if state == 'allocated':
-                        hwthreads.append(int(cid) + int(socket) * self.config['nodes']['cores_per_socket'])
-
-            resources.update({"hwthreads": hwthreads})
+            # Zugriff auf die Knotenressourcen
+            if 'nodes' in job['job_resources'] and 'allocation' in job['job_resources']['nodes']:
+                allocations = job['job_resources']['nodes']['allocation']
+                if i < len(allocations):
+                    alloc = allocations[i]  # Hole die aktuelle Zuweisung
+                    sockets = alloc.get('sockets', [])  # Hole Sockets aus der aktuellen Zuweisung
+                    hwthreads = []
+                    for socket in sockets:
+                        for core in socket.get('cores', []):
+                            if 'ALLOCATED' in core.get('status', []):  # Prüfe den Status
+                                hwthreads.append(core['index'])  # Index hinzufügen
+                    resources.update({"hwthreads": hwthreads})
+                else:
+                    print(f"Warning: Index {i} out of range for node allocations")
+            else:
+                print("Error: Missing 'nodes' or 'allocation' in job['job_resources']")
+                resources.update({"hwthreads": []})
 
             # Get allocated GPUs if some are requested
             if len(job['gres_detail']) > 0:
-                
                 gres = job['gres_detail'][i]
                 acc_ids = self._getACCIDsFromGRES(gres, node)
                 if len(acc_ids) > 0:
@@ -288,12 +305,12 @@ class SlurmSync:
         for job in self.slurmJobData['jobs']:
             if job['job_id'] == jobid:
                 jobInSqueue = True
-                jobstate = job['job_state'].lower()
-                endtime = job['end_time']
+                jobstate = job['job_state'][0].lower()
+                endtime = job['end_time']['number']
                 if jobstate not in ['running', 'completed', 'failed', 'cancelled', 'stopped', 'timeout', 'preempted', 'out_of_memory' ]:
                     jobstate = 'failed'
 
-                if int(ccjob['startTime']) >= int(job['end_time']):
+                if int(ccjob['startTime']) >= int(job['end_time']['number']):
                     print("squeue correction")
                     # For some reason (needs to get investigated), failed jobs sometimes report 
                     # an earlier end time in squee than the starting time in CC. If this is the
@@ -304,9 +321,9 @@ class SlurmSync:
         if not jobInSqueue:
             jobsAcctData = self._getAccDataForJob(jobid)['jobs']
             for j in jobsAcctData:
-                if len(j['steps']) > 0 and j['steps'][0]['time']['start'] == ccjob['startTime']:
+                if len(j['steps']) > 0 and j['steps'][0]['time']['start']['number'] == ccjob['startTime']:
                     jobAcctData = j
-            jobstate = jobAcctData['state']['current'].lower()
+            jobstate = jobAcctData['state']['current'][0].lower()
             endtime = jobAcctData['time']['end']
 
             if jobstate not in ['running', 'completed', 'failed', 'cancelled', 'stopped', 'timeout', 'preempted', 'out_of_memory' ]:
@@ -330,8 +347,11 @@ class SlurmSync:
 
         self.ccapi.stopJob(data)
 
+
     def _convertNodelist(self, nodelist):
+        nodelist = extract_nodelist(nodelist)
         # Use slurm to convert a nodelist with ranges into a comma separated list of unique nodes
+       # print(f"Debug: nodelist is {nodelist}, type: {type(nodelist)}")
         if re.search(self.config['node_regex'], nodelist):
             command = "%s show hostname %s | paste -d, -s" % (self.config['slurm']['scontrol'], nodelist)
             retval = self._exec(command).split(',')
@@ -377,7 +397,7 @@ class SlurmSync:
                     print("INFO: Job %s: disable_cc_sumbission is set. Continue with next job" % job['job_id'])
                     continue
                 # consider only running jobs
-                if job['job_state'] == "RUNNING":
+                if job['job_state'] == [ "RUNNING" ]:
                     if jobid:
                         if int(job['job_id']) == int(jobid) and not self._jobIdInCC(job['job_id']):
                             self._ccStartJob(job)
